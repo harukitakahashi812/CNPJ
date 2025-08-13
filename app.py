@@ -14,6 +14,7 @@ from threading import Thread, Lock
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
+import os as _os
 
 
 app = Flask(__name__)
@@ -28,6 +29,9 @@ TASKS: Dict[str, Dict] = {}
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# small in-memory contact cache to avoid repeated scrapes per run
+CONTACT_CACHE: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
 
 
 USER_AGENTS = [
@@ -222,6 +226,11 @@ def scrape_guiamais(company_name: Optional[str]) -> Tuple[Optional[str], Optiona
 
 
 def scrape_fallback(company_name: Optional[str], cnpj: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    # Return cached value first
+    cache_key = (cnpj or "") + "|" + (company_name or "")
+    if cache_key in CONTACT_CACHE:
+        return CONTACT_CACHE[cache_key]
+
     # Run multiple lightweight scrapers in parallel and return first hit
     sources = []
     if company_name:
@@ -236,9 +245,11 @@ def scrape_fallback(company_name: Optional[str], cnpj: Optional[str]) -> Tuple[O
             try:
                 p, e = f.result()
                 if p or e:
+                    CONTACT_CACHE[cache_key] = (p, e)
                     return p, e
             except Exception:
                 continue
+    CONTACT_CACHE[cache_key] = (None, None)
     return None, None
 
 
@@ -337,9 +348,9 @@ def _background_process(task_id: str, cnpjs: List[str]) -> None:
         # Parallel processing with a small pool to balance speed and rate limits
         # Allow tuning via env; default 8
         try:
-            env_workers = int(os.environ.get("PARALLEL_WORKERS", "8"))
+            env_workers = int(os.environ.get("PARALLEL_WORKERS", "12"))
         except Exception:
-            env_workers = 8
+            env_workers = 12
         max_workers = max(1, env_workers)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_raw = {executor.submit(_process_single, raw): raw for raw in cnpjs}
