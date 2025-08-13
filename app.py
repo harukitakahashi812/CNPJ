@@ -12,6 +12,8 @@ from flask import Flask, render_template, request, send_file, jsonify, session
 from unidecode import unidecode
 from threading import Thread, Lock
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 
 
 app = Flask(__name__)
@@ -40,6 +42,32 @@ def rotate_headers() -> Dict[str, str]:
     return {"User-Agent": agent}
 
 
+class RateLimiter:
+    def __init__(self, min_interval_seconds: float = 1.0):
+        self.min_interval_seconds = min_interval_seconds
+        self._last_by_host: Dict[str, float] = {}
+        self._lock = Lock()
+
+    def wait(self, host: str) -> None:
+        with self._lock:
+            now = time.time()
+            last = self._last_by_host.get(host, 0.0)
+            to_wait = self.min_interval_seconds - (now - last)
+            if to_wait > 0:
+                time.sleep(to_wait)
+                now = time.time()
+            self._last_by_host[host] = now
+
+
+RATE_LIMITER = RateLimiter(1.0)
+
+
+def rate_limited_get(url: str, headers: Dict[str, str], timeout: int) -> requests.Response:
+    host = urlparse(url).netloc
+    RATE_LIMITER.wait(host)
+    return requests.get(url, headers=headers, timeout=timeout)
+
+
 def clean_cnpj(raw: str) -> Optional[str]:
     if not raw:
         return None
@@ -56,7 +84,7 @@ def slugify(text: str) -> str:
 def fetch_cnpj_data(cnpj: str) -> Optional[dict]:
     url = f"https://publica.cnpj.ws/cnpj/{cnpj}"
     try:
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+        resp = rate_limited_get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
         if resp.status_code == 200:
             return resp.json()
         return None
@@ -89,7 +117,7 @@ def parse_api_fields(data: dict) -> Dict[str, Optional[str]]:
 def scrape_telelistas(query: str) -> Tuple[Optional[str], Optional[str]]:
     try:
         url = f"https://www.telelistas.net/busca?q={requests.utils.quote(query)}"
-        r = requests.get(url, headers=rotate_headers(), timeout=30)
+        r = rate_limited_get(url, headers=rotate_headers(), timeout=30)
         if r.status_code != 200:
             return None, None
         soup = BeautifulSoup(r.text, "html.parser")
@@ -114,7 +142,7 @@ def scrape_consultasocio(query: str) -> Tuple[Optional[str], Optional[str]]:
     try:
         # First try search by company name
         search_url = f"https://www.consultasocio.com/q/{requests.utils.quote(query)}"
-        r = requests.get(search_url, headers=rotate_headers(), timeout=30)
+        r = rate_limited_get(search_url, headers=rotate_headers(), timeout=30)
         if r.status_code != 200:
             return None, None
         soup = BeautifulSoup(r.text, "html.parser")
@@ -122,7 +150,7 @@ def scrape_consultasocio(query: str) -> Tuple[Optional[str], Optional[str]]:
         company_link = soup.select_one('a[href*="/empresa/"]')
         if company_link and company_link.get('href'):
             detail_url = "https://www.consultasocio.com" + company_link.get('href')
-            d = requests.get(detail_url, headers=rotate_headers(), timeout=30)
+            d = rate_limited_get(detail_url, headers=rotate_headers(), timeout=30)
             if d.status_code == 200:
                 dsoup = BeautifulSoup(d.text, "html.parser")
                 text = dsoup.get_text(" ")
@@ -223,6 +251,20 @@ def _read_json(path: str) -> Optional[Dict]:
         return None
 
 
+def _process_single(cnpj_raw: str) -> str:
+    cnpj = clean_cnpj(cnpj_raw)
+    if not cnpj:
+        return ""
+    data = fetch_cnpj_data(cnpj)
+    fields = parse_api_fields(data) if data else {}
+    if not fields.get("telefone") or not fields.get("email"):
+        # scraping calls are also rate-limited per-host inside helpers
+        s_phone, s_email = scrape_fallback(fields.get("razao_social"))
+        fields["telefone"] = fields.get("telefone") or s_phone
+        fields["email"] = fields.get("email") or s_email
+    return format_output_block(cnpj, fields)
+
+
 def _background_process(task_id: str, cnpjs: List[str]) -> None:
     status_path = os.path.join(OUTPUT_DIR, f"{task_id}.json")
     out_path = os.path.join(OUTPUT_DIR, f"resultado_{task_id}.txt")
@@ -232,29 +274,24 @@ def _background_process(task_id: str, cnpjs: List[str]) -> None:
         state = {"status": "running", "processed": 0, "total": total, "file": out_path}
         _write_json(status_path, state)
 
-        for raw in cnpjs:
-            try:
-                cnpj = clean_cnpj(raw)
-                if not cnpj:
-                    continue
-                data = fetch_cnpj_data(cnpj)
-                fields = parse_api_fields(data) if data else {}
-                if not fields.get("telefone") or not fields.get("email"):
-                    time.sleep(1)
-                    s_phone, s_email = scrape_fallback(fields.get("razao_social"))
-                    fields["telefone"] = fields.get("telefone") or s_phone
-                    fields["email"] = fields.get("email") or s_email
-                time.sleep(1)
-                block = format_output_block(cnpj, fields)
-                out.write(block + "\n\n")
-                out.flush()
-            except Exception as exc:
-                out.write(f"ERROR processing CNPJ: {raw}\n{exc}\n\n")
-                out.flush()
-            finally:
-                processed += 1
-                state = {"status": "running", "processed": processed, "total": total, "file": out_path}
-                _write_json(status_path, state)
+        # Parallel processing with a small pool to balance speed and rate limits
+        max_workers = min(5, max(1, os.cpu_count() or 2))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_raw = {executor.submit(_process_single, raw): raw for raw in cnpjs}
+            for future in as_completed(future_to_raw):
+                raw = future_to_raw[future]
+                try:
+                    block = future.result()
+                    if block:
+                        out.write(block + "\n\n")
+                        out.flush()
+                except Exception as exc:
+                    out.write(f"ERROR processing CNPJ: {raw}\n{exc}\n\n")
+                    out.flush()
+                finally:
+                    processed += 1
+                    state = {"status": "running", "processed": processed, "total": total, "file": out_path}
+                    _write_json(status_path, state)
 
     state = {"status": "done", "processed": processed, "total": total, "file": out_path}
     _write_json(status_path, state)
