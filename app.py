@@ -33,6 +33,32 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # small in-memory contact cache to avoid repeated scrapes per run
 CONTACT_CACHE: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+BANK_MAP_PATHS = [
+    os.path.join(os.path.dirname(__file__), "bank.csv"),
+    os.path.join(os.path.dirname(__file__), "bank_map.csv"),
+    os.path.join(os.path.dirname(__file__), "data", "bank.csv"),
+]
+
+
+def load_bank_map() -> Dict[str, Dict[str, str]]:
+    bank_map: Dict[str, Dict[str, str]] = {}
+    for p in BANK_MAP_PATHS:
+        try:
+            if os.path.isfile(p):
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        c = clean_cnpj(row.get("cnpj", ""))
+                        if not c:
+                            continue
+                        bank_map[c] = {
+                            "agencia": (row.get("agencia", "") or "").strip(),
+                            "conta": (row.get("conta", "") or "").strip(),
+                        }
+                break
+        except Exception:
+            continue
+    return bank_map
 
 
 USER_AGENTS = [
@@ -392,23 +418,8 @@ def process():
     content = file.stream.read().decode("utf-8", errors="ignore")
     lines = [line.strip() for line in content.splitlines() if line.strip()]
 
-    # Optional bank mapping CSV: columns cnpj,agencia,conta
-    bank_map: Dict[str, Dict[str, str]] = {}
-    if "bank" in request.files and request.files["bank"].filename:
-        try:
-            csv_bytes = request.files["bank"].stream.read()
-            text = csv_bytes.decode("utf-8", errors="ignore")
-            reader = csv.DictReader(text.splitlines())
-            for row in reader:
-                c = clean_cnpj(row.get("cnpj", ""))
-                if not c:
-                    continue
-                bank_map[c] = {
-                    "agencia": (row.get("agencia", "") or "").strip(),
-                    "conta": (row.get("conta", "") or "").strip(),
-                }
-        except Exception:
-            pass
+    # Load optional bank mapping from disk (bank.csv) to avoid requiring a second upload
+    bank_map = load_bank_map()
 
     task_id = uuid.uuid4().hex
     # Start background processing

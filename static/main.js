@@ -5,7 +5,6 @@ document.addEventListener('DOMContentLoaded', () => {
   const spinner = document.getElementById('spinner');
   const statusText = document.getElementById('statusText');
   const downloadBtn = document.getElementById('downloadBtn');
-  const bankInput = document.getElementById('bankInput');
   let currentTaskId = null;
 
   form.addEventListener('submit', async (e) => {
@@ -21,11 +20,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     const formData = new FormData();
     formData.append('file', fileInput.files[0]);
-    if (bankInput && bankInput.files[0]) {
-      formData.append('bank', bankInput.files[0]);
-    }
 
     processBtn.disabled = true;
+    fileInput.disabled = true;
     spinner.classList.remove('hidden');
     statusText.textContent = 'Processing...';
     downloadBtn.classList.add('hidden');
@@ -45,6 +42,8 @@ document.addEventListener('DOMContentLoaded', () => {
         if (s && s.status === 'done') {
           statusText.textContent = `Done (${s.processed}/${s.total}).`;
           downloadBtn.classList.remove('hidden');
+          // clear the file input after success for repeat runs
+          fileInput.value = '';
           return;
         }
         if (s && s.total) {
@@ -59,6 +58,7 @@ document.addEventListener('DOMContentLoaded', () => {
     } finally {
       spinner.classList.add('hidden');
       processBtn.disabled = false;
+      fileInput.disabled = false;
     }
   });
 
