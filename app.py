@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 import os as _os
 import csv
+import os
 
 
 app = Flask(__name__)
@@ -252,6 +253,69 @@ def scrape_guiamais(company_name: Optional[str]) -> Tuple[Optional[str], Optiona
         return None, None
 
 
+def scrape_cnpj_info(cnpj: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        if not cnpj:
+            return None, None
+        url = f"https://cnpj.info/{cnpj}"
+        r = rate_limited_get(url, headers=rotate_headers(), timeout=30)
+        if r.status_code != 200:
+            return None, None
+        return _extract_phone_email(r.text)
+    except Exception:
+        return None, None
+
+
+def scrape_empresite(query: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        if not query:
+            return None, None
+        # Use Jusbrasil Empresite search
+        url = f"https://www.jusbrasil.com.br/empresas/busca?q={requests.utils.quote(query)}"
+        r = rate_limited_get(url, headers=rotate_headers(), timeout=30)
+        if r.status_code != 200:
+            return None, None
+        return _extract_phone_email(r.text)
+    except Exception:
+        return None, None
+
+
+def scrape_google_cse(query: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        api_key = os.environ.get("GOOGLE_API_KEY")
+        cse_id = os.environ.get("GOOGLE_CSE_ID")
+        if not query or not api_key or not cse_id:
+            return None, None
+        api_url = (
+            "https://www.googleapis.com/customsearch/v1?key="
+            + requests.utils.quote(api_key)
+            + "&cx="
+            + requests.utils.quote(cse_id)
+            + "&num=3&q="
+            + requests.utils.quote(query)
+        )
+        sres = rate_limited_get(api_url, headers=rotate_headers(), timeout=30)
+        if sres.status_code != 200:
+            return None, None
+        js = sres.json()
+        items = js.get("items") or []
+        for it in items:
+            link = it.get("link")
+            if not link:
+                continue
+            try:
+                page = rate_limited_get(link, headers=rotate_headers(), timeout=30)
+                if page.status_code == 200:
+                    phone, email = _extract_phone_email(page.text)
+                    if phone or email:
+                        return phone, email
+            except Exception:
+                continue
+        return None, None
+    except Exception:
+        return None, None
+
+
 def scrape_fallback(company_name: Optional[str], cnpj: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     # Return cached value first
     cache_key = (cnpj or "") + "|" + (company_name or "")
@@ -264,7 +328,10 @@ def scrape_fallback(company_name: Optional[str], cnpj: Optional[str]) -> Tuple[O
         sources.append((scrape_telelistas, (company_name,)))
         sources.append((scrape_consultasocio, (company_name,)))
         sources.append((scrape_guiamais, (company_name,)))
+        sources.append((scrape_empresite, (company_name,)))
+        sources.append((scrape_google_cse, (company_name,)))
     sources.append((scrape_cnpj_biz, (cnpj, company_name)))
+    sources.append((scrape_cnpj_info, (cnpj,)))
 
     with ThreadPoolExecutor(max_workers=len(sources)) as ex:
         futures = [ex.submit(fn, *args) for fn, args in sources]
