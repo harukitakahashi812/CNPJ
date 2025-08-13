@@ -5,6 +5,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const spinner = document.getElementById('spinner');
   const statusText = document.getElementById('statusText');
   const downloadBtn = document.getElementById('downloadBtn');
+  let currentTaskId = null;
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -27,10 +28,27 @@ document.addEventListener('DOMContentLoaded', () => {
 
     try {
       const res = await fetch('/process', { method: 'POST', body: formData });
-      const data = await res.json();
+      const text = await res.text();
+      let data; try { data = JSON.parse(text); } catch (e) { throw new Error('Server returned HTML instead of JSON. Please retry.'); }
       if (!res.ok) throw new Error(data.error || 'Failed');
-      statusText.textContent = 'Done.';
-      downloadBtn.classList.remove('hidden');
+      currentTaskId = data.task_id;
+      statusText.textContent = 'Queued...';
+      // poll status
+      const poll = async () => {
+        if (!currentTaskId) return;
+        const r = await fetch(`/status/${currentTaskId}`);
+        const s = await r.json();
+        if (s && s.status === 'done') {
+          statusText.textContent = `Done (${s.processed}/${s.total}).`;
+          downloadBtn.classList.remove('hidden');
+          return;
+        }
+        if (s && s.total) {
+          statusText.textContent = `Processing ${s.processed}/${s.total}...`;
+        }
+        setTimeout(poll, 1500);
+      };
+      poll();
     } catch (err) {
       statusText.textContent = 'Error.';
       alert(err.message || 'Failed to process');
@@ -41,7 +59,11 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   downloadBtn.addEventListener('click', () => {
-    window.location.href = '/download';
+    if (currentTaskId) {
+      window.location.href = `/download/${currentTaskId}`;
+    } else {
+      window.location.href = '/download';
+    }
   });
 });
 

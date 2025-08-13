@@ -10,6 +10,8 @@ import requests
 from bs4 import BeautifulSoup
 from flask import Flask, render_template, request, send_file, jsonify, session
 from unidecode import unidecode
+from threading import Thread, Lock
+import json
 
 
 app = Flask(__name__)
@@ -17,6 +19,10 @@ app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret-key")
 
 # simple in-memory result store per session id
 RESULT_STORE: Dict[str, bytes] = {}
+
+# background task bookkeeping (also mirrored to disk for multi-worker safety)
+TASK_LOCK = Lock()
+TASKS: Dict[str, Dict] = {}
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -202,6 +208,58 @@ def process_cnpjs(cnpjs: List[str]) -> str:
     return "\n\n".join(output_blocks) + "\n"
 
 
+def _write_json(path: str, data: Dict) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _read_json(path: str) -> Optional[Dict]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _background_process(task_id: str, cnpjs: List[str]) -> None:
+    status_path = os.path.join(OUTPUT_DIR, f"{task_id}.json")
+    out_path = os.path.join(OUTPUT_DIR, f"resultado_{task_id}.txt")
+    with open(out_path, "w", encoding="utf-8") as out:
+        total = len(cnpjs)
+        processed = 0
+        state = {"status": "running", "processed": 0, "total": total, "file": out_path}
+        _write_json(status_path, state)
+
+        for raw in cnpjs:
+            try:
+                cnpj = clean_cnpj(raw)
+                if not cnpj:
+                    continue
+                data = fetch_cnpj_data(cnpj)
+                fields = parse_api_fields(data) if data else {}
+                if not fields.get("telefone") or not fields.get("email"):
+                    time.sleep(1)
+                    s_phone, s_email = scrape_fallback(fields.get("razao_social"))
+                    fields["telefone"] = fields.get("telefone") or s_phone
+                    fields["email"] = fields.get("email") or s_email
+                time.sleep(1)
+                block = format_output_block(cnpj, fields)
+                out.write(block + "\n\n")
+                out.flush()
+            except Exception as exc:
+                out.write(f"ERROR processing CNPJ: {raw}\n{exc}\n\n")
+                out.flush()
+            finally:
+                processed += 1
+                state = {"status": "running", "processed": processed, "total": total, "file": out_path}
+                _write_json(status_path, state)
+
+    state = {"status": "done", "processed": processed, "total": total, "file": out_path}
+    _write_json(status_path, state)
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -217,21 +275,20 @@ def process():
     content = file.stream.read().decode("utf-8", errors="ignore")
     lines = [line.strip() for line in content.splitlines() if line.strip()]
 
-    result_text = process_cnpjs(lines)
-    # Keep in memory for download per session id
-    sid = session.get("sid")
-    if not sid:
-        sid = uuid.uuid4().hex
-        session["sid"] = sid
-    RESULT_STORE[sid] = result_text.encode("utf-8")
+    task_id = uuid.uuid4().hex
+    # Start background processing
+    with TASK_LOCK:
+        TASKS[task_id] = {"status": "queued", "processed": 0, "total": len(lines)}
+    t = Thread(target=_background_process, args=(task_id, lines), daemon=True)
+    t.start()
+    return jsonify({"task_id": task_id})
 
-    # Also save to disk so it persists for download
-    filename = f"resultado_{sid}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    file_path = os.path.join(OUTPUT_DIR, filename)
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(result_text)
-    session["result_path"] = file_path
-    return jsonify({"status": "ok"})
+
+@app.route("/status/<task_id>")
+def status(task_id: str):
+    status_path = os.path.join(OUTPUT_DIR, f"{task_id}.json")
+    data = _read_json(status_path) or {"status": "unknown"}
+    return jsonify(data)
 
 
 @app.route("/download")
@@ -246,6 +303,18 @@ def download():
     mem.seek(0)
     filename = f"resultado_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     return send_file(mem, as_attachment=True, download_name=filename, mimetype="text/plain; charset=utf-8")
+
+
+@app.route("/download/<task_id>")
+def download_task(task_id: str):
+    status_path = os.path.join(OUTPUT_DIR, f"{task_id}.json")
+    data = _read_json(status_path)
+    if not data or "file" not in data:
+        return jsonify({"error": "Task not found"}), 404
+    file_path = data.get("file")
+    if not (file_path and os.path.isfile(file_path)):
+        return jsonify({"error": "Result not ready"}), 400
+    return send_file(file_path, as_attachment=True, download_name=os.path.basename(file_path), mimetype="text/plain; charset=utf-8")
 
 
 if __name__ == "__main__":
