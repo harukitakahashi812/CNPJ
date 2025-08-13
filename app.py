@@ -143,26 +143,28 @@ def parse_api_fields(data: dict) -> Dict[str, Optional[str]]:
     }
 
 
+def _extract_phone_email(text: str) -> Tuple[Optional[str], Optional[str]]:
+    phone = None
+    email = None
+    pm = re.search(r"(\(?\d{2}\)?\s?\d{4,5}-?\d{4})", text)
+    if pm:
+        digits = re.findall(r"\d", pm.group(0))
+        if digits:
+            phone = "".join(digits)
+    em = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
+    if em:
+        email = em.group(0)
+    return phone, email
+
+
 def scrape_telelistas(query: str) -> Tuple[Optional[str], Optional[str]]:
     try:
         url = f"https://www.telelistas.net/busca?q={requests.utils.quote(query)}"
         r = rate_limited_get(url, headers=rotate_headers(), timeout=30)
         if r.status_code != 200:
             return None, None
-        soup = BeautifulSoup(r.text, "html.parser")
-        possible_phone = None
-        phone_el = soup.find(text=re.compile(r"\(?\d{2}\)?\s?\d{4,5}-?\d{4}"))
-        if phone_el:
-            match = re.search(r"(\d{2})\D*(\d{4,5})\D*(\d{4})", phone_el)
-            if match:
-                possible_phone = "".join(match.groups())
-        possible_email = None
-        email_el = soup.find(text=re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"))
-        if email_el:
-            em = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", email_el)
-            if em:
-                possible_email = em.group(0)
-        return possible_phone, possible_email
+        phone, email = _extract_phone_email(r.text)
+        return phone, email
     except Exception:
         return None, None
 
@@ -175,40 +177,69 @@ def scrape_consultasocio(query: str) -> Tuple[Optional[str], Optional[str]]:
         if r.status_code != 200:
             return None, None
         soup = BeautifulSoup(r.text, "html.parser")
-        # Try to find a company link
         company_link = soup.select_one('a[href*="/empresa/"]')
         if company_link and company_link.get('href'):
             detail_url = "https://www.consultasocio.com" + company_link.get('href')
             d = rate_limited_get(detail_url, headers=rotate_headers(), timeout=30)
             if d.status_code == 200:
-                dsoup = BeautifulSoup(d.text, "html.parser")
-                text = dsoup.get_text(" ")
-                phone = None
-                email = None
-                pm = re.search(r"(\(?\d{2}\)?\s?\d{4,5}-?\d{4})", text)
-                if pm:
-                    digits = re.findall(r"\d", pm.group(0))
-                    if digits:
-                        phone = "".join(digits)
-                em = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
-                if em:
-                    email = em.group(0)
+                text = BeautifulSoup(d.text, "html.parser").get_text(" ")
+                phone, email = _extract_phone_email(text)
                 return phone, email
         return None, None
     except Exception:
         return None, None
 
 
-def scrape_fallback(company_name: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    if not company_name:
+def scrape_cnpj_biz(cnpj: Optional[str], company_name: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        if cnpj:
+            url = f"https://cnpj.biz/{cnpj}"
+            r = rate_limited_get(url, headers=rotate_headers(), timeout=30)
+            if r.status_code == 200:
+                return _extract_phone_email(r.text)
+        if company_name:
+            url = f"https://cnpj.biz/search?q={requests.utils.quote(company_name)}"
+            r = rate_limited_get(url, headers=rotate_headers(), timeout=30)
+            if r.status_code == 200:
+                return _extract_phone_email(r.text)
+    except Exception:
         return None, None
-    phone, email = scrape_telelistas(company_name)
-    if not phone or not email:
-        time.sleep(1)
-        p2, e2 = scrape_consultasocio(company_name)
-        phone = phone or p2
-        email = email or e2
-    return phone, email
+    return None, None
+
+
+def scrape_guiamais(company_name: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        if not company_name:
+            return None, None
+        slug = requests.utils.quote(company_name)
+        url = f"https://www.guiamais.com.br/busca/{slug}"
+        r = rate_limited_get(url, headers=rotate_headers(), timeout=30)
+        if r.status_code != 200:
+            return None, None
+        return _extract_phone_email(r.text)
+    except Exception:
+        return None, None
+
+
+def scrape_fallback(company_name: Optional[str], cnpj: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    # Run multiple lightweight scrapers in parallel and return first hit
+    sources = []
+    if company_name:
+        sources.append((scrape_telelistas, (company_name,)))
+        sources.append((scrape_consultasocio, (company_name,)))
+        sources.append((scrape_guiamais, (company_name,)))
+    sources.append((scrape_cnpj_biz, (cnpj, company_name)))
+
+    with ThreadPoolExecutor(max_workers=len(sources)) as ex:
+        futures = [ex.submit(fn, *args) for fn, args in sources]
+        for f in as_completed(futures):
+            try:
+                p, e = f.result()
+                if p or e:
+                    return p, e
+            except Exception:
+                continue
+    return None, None
 
 
 def format_output_block(cnpj: str, fields: Dict[str, Optional[str]]) -> str:
@@ -225,19 +256,18 @@ def format_output_block(cnpj: str, fields: Dict[str, Optional[str]]) -> str:
     email = fields.get("email") or ""
 
     # Adhering to required exact labels and order
-    # Add minimal emojis while keeping exact label text
     lines = [
-        f"NOME NA BRADESCO: {razao_social_upper} BOM 💼",
+        f"NOME NA BRADESCO: {razao_social_upper} BOM",
         "AGENCIA: ",
         "CONTA: ",
-        f"NOME API DE PUXADA: {slug} 🔗",
-        f"CNPJ: {cnpj} 🆔",
-        f"NATUREZA: {natureza} 🧾",
-        f"SITUAÇAO: {situacao} desde {data_inicio} 📅",
-        f"PORTE: {porte} 🧱",
-        f"MEI: {mei} ✅" if mei == "Yes" else f"MEI: {mei} ❌",
-        f"TEL: {telefone} ☎️",
-        f"EMAIL: {email} ✉️",
+        f"NOME API DE PUXADA: {slug}",
+        f"CNPJ: {cnpj}",
+        f"NATUREZA: {natureza}",
+        f"SITUAÇAO: {situacao} desde {data_inicio}",
+        f"PORTE: {porte}",
+        f"MEI: {mei}",
+        f"TEL: {telefone}",
+        f"EMAIL: {email}",
     ]
     return "\n".join(lines)
 
@@ -289,7 +319,7 @@ def _process_single(cnpj_raw: str) -> str:
     fields = parse_api_fields(data) if data else {}
     if not fields.get("telefone") or not fields.get("email"):
         # scraping calls are also rate-limited per-host inside helpers
-        s_phone, s_email = scrape_fallback(fields.get("razao_social"))
+        s_phone, s_email = scrape_fallback(fields.get("razao_social"), cnpj)
         fields["telefone"] = fields.get("telefone") or s_phone
         fields["email"] = fields.get("email") or s_email
     return format_output_block(cnpj, fields)
