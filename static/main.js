@@ -5,6 +5,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const spinner = document.getElementById('spinner');
   const statusText = document.getElementById('statusText');
   const downloadBtn = document.getElementById('downloadBtn');
+  const bankInput = document.getElementById('bankInput');
   let currentTaskId = null;
 
   form.addEventListener('submit', async (e) => {
@@ -20,6 +21,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     const formData = new FormData();
     formData.append('file', fileInput.files[0]);
+    if (bankInput && bankInput.files[0]) {
+      formData.append('bank', bankInput.files[0]);
+    }
 
     processBtn.disabled = true;
     spinner.classList.remove('hidden');

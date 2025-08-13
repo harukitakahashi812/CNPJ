@@ -15,6 +15,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 import os as _os
+import csv
 
 
 app = Flask(__name__)
@@ -253,7 +254,7 @@ def scrape_fallback(company_name: Optional[str], cnpj: Optional[str]) -> Tuple[O
     return None, None
 
 
-def format_output_block(cnpj: str, fields: Dict[str, Optional[str]]) -> str:
+def format_output_block(cnpj: str, fields: Dict[str, Optional[str]], agencia: str = "", conta: str = "") -> str:
     razao_social = (fields.get("razao_social") or "").strip()
     razao_social_upper = razao_social.upper()
     slug = slugify(razao_social)
@@ -269,8 +270,8 @@ def format_output_block(cnpj: str, fields: Dict[str, Optional[str]]) -> str:
     # Adhering to required exact labels and order
     lines = [
         f"NOME NA BRADESCO: {razao_social_upper} BOM",
-        "AGENCIA: ",
-        "CONTA: ",
+        f"AGENCIA: {agencia}",
+        f"CONTA: {conta}",
         f"NOME API DE PUXADA: {slug}",
         f"CNPJ: {cnpj}",
         f"NATUREZA: {natureza}",
@@ -322,7 +323,7 @@ def _read_json(path: str) -> Optional[Dict]:
         return None
 
 
-def _process_single(cnpj_raw: str) -> str:
+def _process_single(cnpj_raw: str, bank_map: Dict[str, Dict[str, str]]) -> str:
     cnpj = clean_cnpj(cnpj_raw)
     if not cnpj:
         return ""
@@ -333,10 +334,11 @@ def _process_single(cnpj_raw: str) -> str:
         s_phone, s_email = scrape_fallback(fields.get("razao_social"), cnpj)
         fields["telefone"] = fields.get("telefone") or s_phone
         fields["email"] = fields.get("email") or s_email
-    return format_output_block(cnpj, fields)
+    bank = bank_map.get(cnpj) or {}
+    return format_output_block(cnpj, fields, agencia=bank.get("agencia", ""), conta=bank.get("conta", ""))
 
 
-def _background_process(task_id: str, cnpjs: List[str]) -> None:
+def _background_process(task_id: str, cnpjs: List[str], bank_map: Optional[Dict[str, Dict[str, str]]] = None) -> None:
     status_path = os.path.join(OUTPUT_DIR, f"{task_id}.json")
     out_path = os.path.join(OUTPUT_DIR, f"resultado_{task_id}.txt")
     with open(out_path, "w", encoding="utf-8") as out:
@@ -344,6 +346,8 @@ def _background_process(task_id: str, cnpjs: List[str]) -> None:
         processed = 0
         state = {"status": "running", "processed": 0, "total": total, "file": out_path}
         _write_json(status_path, state)
+
+        bank_map = bank_map or {}
 
         # Parallel processing with a small pool to balance speed and rate limits
         # Allow tuning via env; default 8
@@ -353,7 +357,7 @@ def _background_process(task_id: str, cnpjs: List[str]) -> None:
             env_workers = 12
         max_workers = max(1, env_workers)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_raw = {executor.submit(_process_single, raw): raw for raw in cnpjs}
+            future_to_raw = {executor.submit(_process_single, raw, bank_map): raw for raw in cnpjs}
             for future in as_completed(future_to_raw):
                 raw = future_to_raw[future]
                 try:
@@ -388,11 +392,29 @@ def process():
     content = file.stream.read().decode("utf-8", errors="ignore")
     lines = [line.strip() for line in content.splitlines() if line.strip()]
 
+    # Optional bank mapping CSV: columns cnpj,agencia,conta
+    bank_map: Dict[str, Dict[str, str]] = {}
+    if "bank" in request.files and request.files["bank"].filename:
+        try:
+            csv_bytes = request.files["bank"].stream.read()
+            text = csv_bytes.decode("utf-8", errors="ignore")
+            reader = csv.DictReader(text.splitlines())
+            for row in reader:
+                c = clean_cnpj(row.get("cnpj", ""))
+                if not c:
+                    continue
+                bank_map[c] = {
+                    "agencia": (row.get("agencia", "") or "").strip(),
+                    "conta": (row.get("conta", "") or "").strip(),
+                }
+        except Exception:
+            pass
+
     task_id = uuid.uuid4().hex
     # Start background processing
     with TASK_LOCK:
         TASKS[task_id] = {"status": "queued", "processed": 0, "total": len(lines)}
-    t = Thread(target=_background_process, args=(task_id, lines), daemon=True)
+    t = Thread(target=_background_process, args=(task_id, lines, bank_map), daemon=True)
     t.start()
     return jsonify({"task_id": task_id})
 
