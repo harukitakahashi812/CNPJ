@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "builds": [
+    { "src": "Dockerfile", "use": "@vercel/docker" }
+  ],
+  "env": {
+    "FLASK_SECRET_KEY": "change-me"
+  }
+}
+
