@@ -68,6 +68,18 @@ def rate_limited_get(url: str, headers: Dict[str, str], timeout: int) -> request
     return requests.get(url, headers=headers, timeout=timeout)
 
 
+def get_json_with_retries(url: str, headers: Dict[str, str], timeout: int = 30, attempts: int = 3) -> Optional[dict]:
+    for i in range(attempts):
+        try:
+            resp = rate_limited_get(url, headers=headers, timeout=timeout)
+            if resp.status_code == 200:
+                return resp.json()
+        except requests.RequestException:
+            pass
+        time.sleep(1 + i)
+    return None
+
+
 def clean_cnpj(raw: str) -> Optional[str]:
     if not raw:
         return None
@@ -82,14 +94,31 @@ def slugify(text: str) -> str:
 
 
 def fetch_cnpj_data(cnpj: str) -> Optional[dict]:
-    url = f"https://publica.cnpj.ws/cnpj/{cnpj}"
-    try:
-        resp = rate_limited_get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
-        if resp.status_code == 200:
-            return resp.json()
-        return None
-    except requests.RequestException:
-        return None
+    # Primary: publica.cnpj.ws
+    primary = get_json_with_retries(f"https://publica.cnpj.ws/cnpj/{cnpj}", headers={"User-Agent": "Mozilla/5.0"})
+    if primary:
+        primary["_source"] = "publica"
+        return primary
+    # Fallback: BrasilAPI
+    fallback = get_json_with_retries(f"https://brasilapi.com.br/api/cnpj/v1/{cnpj}", headers=rotate_headers())
+    if fallback:
+        # Normalize to close shape expected by parse_api_fields
+        normalized = {
+            "razao_social": fallback.get("razao_social") or fallback.get("nome_fantasia") or fallback.get("nome"),
+            "natureza_juridica": {"descricao": (fallback.get("natureza_juridica") or "")},
+            "descricao_situacao_cadastral": fallback.get("situacao_cadastral") or fallback.get("situacao") or "",
+            "data_inicio_atividade": fallback.get("data_inicio_atividade") or fallback.get("data_situacao_cadastral") or fallback.get("data_inicio_atividades") or "",
+            "porte": {"descricao": fallback.get("porte") or ""},
+            "opcao_pelo_mei": bool(fallback.get("mei") or (fallback.get("qualificacao_do_responsavel") == "MEI")),
+            "estabelecimento": {
+                "telefone1": (fallback.get("ddd_telefone_1") or fallback.get("telefone") or "").replace(" ", ""),
+                "telefone2": fallback.get("ddd_telefone_2") or "",
+                "email": fallback.get("email") or "",
+            },
+            "_source": "brasilapi",
+        }
+        return normalized
+    return None
 
 
 def parse_api_fields(data: dict) -> Dict[str, Optional[str]]:
@@ -196,18 +225,19 @@ def format_output_block(cnpj: str, fields: Dict[str, Optional[str]]) -> str:
     email = fields.get("email") or ""
 
     # Adhering to required exact labels and order
+    # Add minimal emojis while keeping exact label text
     lines = [
-        f"NOME NA BRADESCO: {razao_social_upper} BOM",
+        f"NOME NA BRADESCO: {razao_social_upper} BOM 💼",
         "AGENCIA: ",
         "CONTA: ",
-        f"NOME API DE PUXADA: {slug}",
-        f"CNPJ: {cnpj}",
-        f"NATUREZA: {natureza}",
-        f"SITUAÇAO: {situacao} desde {data_inicio}",
-        f"PORTE: {porte}",
-        f"MEI: {mei}",
-        f"TEL: {telefone}",
-        f"EMAIL: {email}",
+        f"NOME API DE PUXADA: {slug} 🔗",
+        f"CNPJ: {cnpj} 🆔",
+        f"NATUREZA: {natureza} 🧾",
+        f"SITUAÇAO: {situacao} desde {data_inicio} 📅",
+        f"PORTE: {porte} 🧱",
+        f"MEI: {mei} ✅" if mei == "Yes" else f"MEI: {mei} ❌",
+        f"TEL: {telefone} ☎️",
+        f"EMAIL: {email} ✉️",
     ]
     return "\n".join(lines)
 
@@ -275,7 +305,12 @@ def _background_process(task_id: str, cnpjs: List[str]) -> None:
         _write_json(status_path, state)
 
         # Parallel processing with a small pool to balance speed and rate limits
-        max_workers = min(5, max(1, os.cpu_count() or 2))
+        # Allow tuning via env; default 8
+        try:
+            env_workers = int(os.environ.get("PARALLEL_WORKERS", "8"))
+        except Exception:
+            env_workers = 8
+        max_workers = max(1, env_workers)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_raw = {executor.submit(_process_single, raw): raw for raw in cnpjs}
             for future in as_completed(future_to_raw):
