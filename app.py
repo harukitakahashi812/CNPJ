@@ -81,7 +81,14 @@ USER_AGENTS = [
 
 def rotate_headers() -> Dict[str, str]:
     agent = USER_AGENTS[int(time.time()) % len(USER_AGENTS)]
-    return {"User-Agent": agent}
+    return {
+        "User-Agent": agent,
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Referer": "https://www.google.com/",
+    }
 
 
 """Global HTTP session with connection pooling for speed."""
@@ -444,23 +451,31 @@ def scrape_google_search(query: Optional[str]) -> Tuple[Optional[str], Optional[
     try:
         if not query:
             return None, None
-        # Use Google search to find company websites
-        search_query = f'"{query}" "contato" OR "telefone" OR "email" site:br'
-        url = f"https://www.google.com/search?q={requests.utils.quote(search_query)}"
+        # Use DuckDuckGo to find company websites (less blocking)
+        search_query = f'"{query}" contato telefone email site:br'
+        url = f"https://duckduckgo.com/html/?q={requests.utils.quote(search_query)}"
         r = rate_limited_get(url, headers=rotate_headers(), timeout=SCRAPE_TIMEOUT)
         if r.status_code == 200:
             # Extract potential company URLs from search results
             soup = BeautifulSoup(r.text, "html.parser")
-            links = soup.select("a[href*='http']")
-            for link in links[:3]:  # Check first 3 results
+            links = soup.select("a[href]")
+            checked = 0
+            for link in links:
                 href = link.get("href", "")
-                if "google.com" not in href and any(domain in href for domain in [".com.br", ".br", ".com"]):
+                if not href.startswith("http"):
+                    continue
+                if any(block in href for block in ["duckduckgo.com", "google.com"]):
+                    continue
+                if any(domain in href for domain in [".com.br", ".br", ".com"]):
                     try:
                         company_page = rate_limited_get(href, headers=rotate_headers(), timeout=SCRAPE_TIMEOUT)
                         if company_page.status_code == 200:
                             phone, email = _extract_phone_email(company_page.text)
                             if phone or email:
                                 return phone, email
+                        checked += 1
+                        if checked >= 5:
+                            break
                     except Exception:
                         continue
     except Exception:
@@ -482,13 +497,16 @@ def extract_emails_from_html(html_content: str) -> List[str]:
     data_emails = re.findall(data_pattern, html_content, re.IGNORECASE)
     emails.extend(data_emails)
     
-    # Method 3: Extract from script tags (JSON data)
+    # Method 3: Extract from script tags (JSON-LD and inline JSON)
     script_pattern = r'<script[^>]*>(.*?)</script>'
     scripts = re.findall(script_pattern, html_content, re.DOTALL | re.IGNORECASE)
     for script in scripts:
         # Look for email patterns in JavaScript
         script_emails = re.findall(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', script, re.IGNORECASE)
         emails.extend(script_emails)
+        # JSON-LD email fields
+        jsonld_emails = re.findall(r'"email"\s*:\s*"([^"]+)"', script, re.IGNORECASE)
+        emails.extend(jsonld_emails)
     
     # Method 4: Extract from meta tags
     meta_pattern = r'<meta[^>]*content="([^"]*[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}[^"]*)"'
@@ -519,7 +537,7 @@ def scrape_company_website(company_name: str) -> Tuple[Optional[str], Optional[s
         
         for website in website_patterns:
             try:
-                r = rate_limited_get(website, headers=rotate_headers(), timeout=10)
+                r = rate_limited_get(website, headers=rotate_headers(), timeout=SCRAPE_TIMEOUT)
                 if r.status_code == 200:
                     # Extract emails using specialized HTML parser
                     emails = extract_emails_from_html(r.text)
@@ -529,6 +547,20 @@ def scrape_company_website(company_name: str) -> Tuple[Optional[str], Optional[s
                         return phone, emails[0]  # Return first valid email
             except Exception:
                 continue
+        # Try common contact page paths
+        common_paths = ["/contato", "/fale-conosco", "/contatos", "/contact", "/contate-nos"]
+        for website in website_patterns:
+            base = website.rstrip('/')
+            for path in common_paths:
+                try:
+                    r = rate_limited_get(base + path, headers=rotate_headers(), timeout=SCRAPE_TIMEOUT)
+                    if r.status_code == 200:
+                        emails = extract_emails_from_html(r.text)
+                        if emails:
+                            phone, _ = _extract_phone_email(r.text)
+                            return phone, emails[0]
+                except Exception:
+                    continue
     except Exception:
         pass
     return None, None
