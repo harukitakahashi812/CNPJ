@@ -56,8 +56,10 @@ def load_bank_map() -> Dict[str, Dict[str, str]]:
                             "agencia": (row.get("agencia", "") or "").strip(),
                             "conta": (row.get("conta", "") or "").strip(),
                         }
+                print(f"Loaded bank data from {p}: {len(bank_map)} entries")
                 break
-        except Exception:
+        except Exception as e:
+            print(f"Failed to load bank data from {p}: {e}")
             continue
     return bank_map
 
@@ -66,6 +68,8 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
     "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:127.0) Gecko/20100101 Firefox/127.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0",
 ]
 
 
@@ -75,7 +79,7 @@ def rotate_headers() -> Dict[str, str]:
 
 
 class RateLimiter:
-    def __init__(self, min_interval_seconds: float = 1.0):
+    def __init__(self, min_interval_seconds: float = 0.5):  # Reduced from 1.0 to 0.5
         self.min_interval_seconds = min_interval_seconds
         self._last_by_host: Dict[str, float] = {}
         self._lock = Lock()
@@ -91,7 +95,7 @@ class RateLimiter:
             self._last_by_host[host] = now
 
 
-RATE_LIMITER = RateLimiter(1.0)
+RATE_LIMITER = RateLimiter(0.5)  # Reduced from 1.0 to 0.5
 
 
 def rate_limited_get(url: str, headers: Dict[str, str], timeout: int) -> requests.Response:
@@ -108,7 +112,7 @@ def get_json_with_retries(url: str, headers: Dict[str, str], timeout: int = 30, 
                 return resp.json()
         except requests.RequestException:
             pass
-        time.sleep(1 + i)
+        time.sleep(0.5 + i * 0.5)  # Reduced sleep time
     return None
 
 
@@ -160,8 +164,23 @@ def parse_api_fields(data: dict) -> Dict[str, Optional[str]]:
     natureza = data.get("natureza_juridica") or {}
     porte = data.get("porte") or {}
 
-    telefone = estabelecimento.get("telefone1") or estabelecimento.get("telefone2")
-    email = estabelecimento.get("email")
+    # Try multiple phone fields
+    telefone = (
+        estabelecimento.get("telefone1") or 
+        estabelecimento.get("telefone2") or 
+        estabelecimento.get("telefone") or
+        data.get("telefone") or
+        data.get("ddd_telefone_1") or
+        data.get("ddd_telefone_2")
+    )
+    
+    # Try multiple email fields
+    email = (
+        estabelecimento.get("email") or
+        data.get("email") or
+        data.get("email_empresa") or
+        data.get("email_contato")
+    )
 
     return {
         "razao_social": data.get("razao_social"),
@@ -178,21 +197,45 @@ def parse_api_fields(data: dict) -> Dict[str, Optional[str]]:
 def _extract_phone_email(text: str) -> Tuple[Optional[str], Optional[str]]:
     phone = None
     email = None
-    pm = re.search(r"(\(?\d{2}\)?\s?\d{4,5}-?\d{4})", text)
-    if pm:
-        digits = re.findall(r"\d", pm.group(0))
-        if digits:
-            phone = "".join(digits)
-    em = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
-    if em:
-        email = em.group(0)
+    
+    # Improved phone regex patterns
+    phone_patterns = [
+        r"(?:\(?(\d{2})\)?\s*)?(\d{4,5})[-\s]?(\d{4})",  # (11) 99999-9999 or 11999999999
+        r"(\d{2})\s*(\d{4,5})\s*(\d{4})",  # 11 99999 9999
+        r"(\d{10,11})",  # 11999999999
+    ]
+    
+    for pattern in phone_patterns:
+        pm = re.search(pattern, text)
+        if pm:
+            if len(pm.groups()) == 3:
+                phone = "".join(pm.groups())
+            elif len(pm.groups()) == 1:
+                phone = pm.group(1)
+            if phone and len(phone) >= 10:
+                break
+    
+    # Improved email regex patterns
+    email_patterns = [
+        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",  # Standard email
+        r"[A-Za-z0-9._%+-]+\s*@\s*[A-Za-z0-9.-]+\s*\.\s*[A-Za-z]{2,}",  # Email with spaces
+        r"[A-Za-z0-9._%+-]+\s*\[at\]\s*[A-Za-z0-9.-]+\s*\[dot\]\s*[A-Za-z]{2,}",  # [at] [dot] format
+    ]
+    
+    for pattern in email_patterns:
+        em = re.search(pattern, text)
+        if em:
+            email = em.group(0).replace(" ", "").replace("[at]", "@").replace("[dot]", ".")
+            if "@" in email and "." in email.split("@")[1]:
+                break
+    
     return phone, email
 
 
 def scrape_telelistas(query: str) -> Tuple[Optional[str], Optional[str]]:
     try:
         url = f"https://www.telelistas.net/busca?q={requests.utils.quote(query)}"
-        r = rate_limited_get(url, headers=rotate_headers(), timeout=30)
+        r = rate_limited_get(url, headers=rotate_headers(), timeout=15)  # Reduced timeout
         if r.status_code != 200:
             return None, None
         phone, email = _extract_phone_email(r.text)
@@ -205,14 +248,14 @@ def scrape_consultasocio(query: str) -> Tuple[Optional[str], Optional[str]]:
     try:
         # First try search by company name
         search_url = f"https://www.consultasocio.com/q/{requests.utils.quote(query)}"
-        r = rate_limited_get(search_url, headers=rotate_headers(), timeout=30)
+        r = rate_limited_get(search_url, headers=rotate_headers(), timeout=15)  # Reduced timeout
         if r.status_code != 200:
             return None, None
         soup = BeautifulSoup(r.text, "html.parser")
         company_link = soup.select_one('a[href*="/empresa/"]')
         if company_link and company_link.get('href'):
             detail_url = "https://www.consultasocio.com" + company_link.get('href')
-            d = rate_limited_get(detail_url, headers=rotate_headers(), timeout=30)
+            d = rate_limited_get(detail_url, headers=rotate_headers(), timeout=15)  # Reduced timeout
             if d.status_code == 200:
                 text = BeautifulSoup(d.text, "html.parser").get_text(" ")
                 phone, email = _extract_phone_email(text)
@@ -226,12 +269,12 @@ def scrape_cnpj_biz(cnpj: Optional[str], company_name: Optional[str]) -> Tuple[O
     try:
         if cnpj:
             url = f"https://cnpj.biz/{cnpj}"
-            r = rate_limited_get(url, headers=rotate_headers(), timeout=30)
+            r = rate_limited_get(url, headers=rotate_headers(), timeout=15)  # Reduced timeout
             if r.status_code == 200:
                 return _extract_phone_email(r.text)
         if company_name:
             url = f"https://cnpj.biz/search?q={requests.utils.quote(company_name)}"
-            r = rate_limited_get(url, headers=rotate_headers(), timeout=30)
+            r = rate_limited_get(url, headers=rotate_headers(), timeout=15)  # Reduced timeout
             if r.status_code == 200:
                 return _extract_phone_email(r.text)
     except Exception:
@@ -245,7 +288,7 @@ def scrape_guiamais(company_name: Optional[str]) -> Tuple[Optional[str], Optiona
             return None, None
         slug = requests.utils.quote(company_name)
         url = f"https://www.guiamais.com.br/busca/{slug}"
-        r = rate_limited_get(url, headers=rotate_headers(), timeout=30)
+        r = rate_limited_get(url, headers=rotate_headers(), timeout=15)  # Reduced timeout
         if r.status_code != 200:
             return None, None
         return _extract_phone_email(r.text)
@@ -258,12 +301,12 @@ def scrape_cnpj_info(cnpj: Optional[str]) -> Tuple[Optional[str], Optional[str]]
         if not cnpj:
             return None, None
         url = f"https://cnpj.info/{cnpj}"
-        r = rate_limited_get(url, headers=rotate_headers(), timeout=30)
-        if r.status_code != 200:
-            return None, None
-        return _extract_phone_email(r.text)
+        r = rate_limited_get(url, headers=rotate_headers(), timeout=15)  # Reduced timeout
+        if r.status_code == 200:
+            return _extract_phone_email(r.text)
     except Exception:
         return None, None
+    return None, None
 
 
 def scrape_empresite(query: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -272,10 +315,33 @@ def scrape_empresite(query: Optional[str]) -> Tuple[Optional[str], Optional[str]
             return None, None
         # Use Jusbrasil Empresite search
         url = f"https://www.jusbrasil.com.br/empresas/busca?q={requests.utils.quote(query)}"
-        r = rate_limited_get(url, headers=rotate_headers(), timeout=30)
-        if r.status_code != 200:
+        r = rate_limited_get(url, headers=rotate_headers(), timeout=15)  # Reduced timeout
+        if r.status_code == 200:
+            return _extract_phone_email(r.text)
+    except Exception:
+        return None, None
+
+
+def scrape_empresascnpj(query: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        if not query:
             return None, None
-        return _extract_phone_email(r.text)
+        url = f"https://empresascnpj.com/busca?q={requests.utils.quote(query)}"
+        r = rate_limited_get(url, headers=rotate_headers(), timeout=15)
+        if r.status_code == 200:
+            return _extract_phone_email(r.text)
+    except Exception:
+        return None, None
+
+
+def scrape_cnpjro(query: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        if not query:
+            return None, None
+        url = f"https://cnpj.ro/busca?q={requests.utils.quote(query)}"
+        r = rate_limited_get(url, headers=rotate_headers(), timeout=15)
+        if r.status_code == 200:
+            return _extract_phone_email(r.text)
     except Exception:
         return None, None
 
@@ -294,7 +360,7 @@ def scrape_google_cse(query: Optional[str]) -> Tuple[Optional[str], Optional[str
             + "&num=3&q="
             + requests.utils.quote(query)
         )
-        sres = rate_limited_get(api_url, headers=rotate_headers(), timeout=30)
+        sres = rate_limited_get(api_url, headers=rotate_headers(), timeout=15)  # Reduced timeout
         if sres.status_code != 200:
             return None, None
         js = sres.json()
@@ -304,7 +370,7 @@ def scrape_google_cse(query: Optional[str]) -> Tuple[Optional[str], Optional[str
             if not link:
                 continue
             try:
-                page = rate_limited_get(link, headers=rotate_headers(), timeout=30)
+                page = rate_limited_get(link, headers=rotate_headers(), timeout=15)  # Reduced timeout
                 if page.status_code == 200:
                     phone, email = _extract_phone_email(page.text)
                     if phone or email:
@@ -329,6 +395,8 @@ def scrape_fallback(company_name: Optional[str], cnpj: Optional[str]) -> Tuple[O
         sources.append((scrape_consultasocio, (company_name,)))
         sources.append((scrape_guiamais, (company_name,)))
         sources.append((scrape_empresite, (company_name,)))
+        sources.append((scrape_empresascnpj, (company_name,)))
+        sources.append((scrape_cnpjro, (company_name,)))
         sources.append((scrape_google_cse, (company_name,)))
     sources.append((scrape_cnpj_biz, (cnpj, company_name)))
     sources.append((scrape_cnpj_info, (cnpj,)))
@@ -388,13 +456,13 @@ def process_cnpjs(cnpjs: List[str]) -> str:
 
         # If phone or email missing, scrape
         if not fields.get("telefone") or not fields.get("email"):
-            time.sleep(1)
+            time.sleep(0.5)  # Reduced from 1.0 to 0.5
             s_phone, s_email = scrape_fallback(fields.get("razao_social"))
             fields["telefone"] = fields.get("telefone") or s_phone
             fields["email"] = fields.get("email") or s_email
 
         # Sleep to avoid rate limits
-        time.sleep(1)
+        time.sleep(0.5)  # Reduced from 1.0 to 0.5
 
         output_blocks.append(format_output_block(cnpj, fields))
 
@@ -416,24 +484,31 @@ def _read_json(path: str) -> Optional[Dict]:
         return None
 
 
-def _process_single(cnpj_raw: str, bank_map: Dict[str, Dict[str, str]]) -> str:
+def _process_single_cnpj(cnpj_raw: str, bank_map: Dict[str, Dict[str, str]]) -> str:
     cnpj = clean_cnpj(cnpj_raw)
     if not cnpj:
         return ""
+    
+    # Fetch API data
     data = fetch_cnpj_data(cnpj)
     fields = parse_api_fields(data) if data else {}
+    
+    # If phone or email missing, scrape
     if not fields.get("telefone") or not fields.get("email"):
-        # scraping calls are also rate-limited per-host inside helpers
         s_phone, s_email = scrape_fallback(fields.get("razao_social"), cnpj)
         fields["telefone"] = fields.get("telefone") or s_phone
         fields["email"] = fields.get("email") or s_email
+    
+    # Get bank data
     bank = bank_map.get(cnpj) or {}
+    
     return format_output_block(cnpj, fields, agencia=bank.get("agencia", ""), conta=bank.get("conta", ""))
 
 
 def _background_process(task_id: str, cnpjs: List[str], bank_map: Optional[Dict[str, Dict[str, str]]] = None) -> None:
     status_path = os.path.join(OUTPUT_DIR, f"{task_id}.json")
     out_path = os.path.join(OUTPUT_DIR, f"resultado_{task_id}.txt")
+    
     with open(out_path, "w", encoding="utf-8") as out:
         total = len(cnpjs)
         processed = 0
@@ -442,15 +517,16 @@ def _background_process(task_id: str, cnpjs: List[str], bank_map: Optional[Dict[
 
         bank_map = bank_map or {}
 
-        # Parallel processing with a small pool to balance speed and rate limits
-        # Allow tuning via env; default 8
+        # Parallel processing with optimized workers
+        # Allow tuning via env; default 16 (increased from 12)
         try:
-            env_workers = int(os.environ.get("PARALLEL_WORKERS", "12"))
+            env_workers = int(os.environ.get("PARALLEL_WORKERS", "16"))
         except Exception:
-            env_workers = 12
+            env_workers = 16
         max_workers = max(1, env_workers)
+        
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_raw = {executor.submit(_process_single, raw, bank_map): raw for raw in cnpjs}
+            future_to_raw = {executor.submit(_process_single_cnpj, raw, bank_map): raw for raw in cnpjs}
             for future in as_completed(future_to_raw):
                 raw = future_to_raw[future]
                 try:
@@ -487,6 +563,7 @@ def process():
 
     # Load optional bank mapping from disk (bank.csv) to avoid requiring a second upload
     bank_map = load_bank_map()
+    print(f"Loaded bank map with {len(bank_map)} entries")
 
     task_id = uuid.uuid4().hex
     # Start background processing
