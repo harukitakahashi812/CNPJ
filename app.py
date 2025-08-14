@@ -7,6 +7,7 @@ from typing import Dict, Optional, Tuple, List
 import uuid
 
 import requests
+from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 from flask import Flask, render_template, request, send_file, jsonify, session
 from unidecode import unidecode
@@ -83,8 +84,21 @@ def rotate_headers() -> Dict[str, str]:
     return {"User-Agent": agent}
 
 
+"""Global HTTP session with connection pooling for speed."""
+SESSION = requests.Session()
+_ADAPTER = HTTPAdapter(pool_connections=100, pool_maxsize=100)
+SESSION.mount("http://", _ADAPTER)
+SESSION.mount("https://", _ADAPTER)
+
+
+# Tunables via environment
+RATE_LIMIT_SECONDS = float(os.environ.get("RATE_LIMIT_SECONDS", "0.3"))
+SCRAPE_TIMEOUT = int(os.environ.get("SCRAPE_TIMEOUT", "10"))
+API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "20"))
+
+
 class RateLimiter:
-    def __init__(self, min_interval_seconds: float = 0.5):  # Reduced from 1.0 to 0.5
+    def __init__(self, min_interval_seconds: float = RATE_LIMIT_SECONDS):
         self.min_interval_seconds = min_interval_seconds
         self._last_by_host: Dict[str, float] = {}
         self._lock = Lock()
@@ -100,16 +114,16 @@ class RateLimiter:
             self._last_by_host[host] = now
 
 
-RATE_LIMITER = RateLimiter(0.5)  # Reduced from 1.0 to 0.5
+RATE_LIMITER = RateLimiter(RATE_LIMIT_SECONDS)
 
 
 def rate_limited_get(url: str, headers: Dict[str, str], timeout: int) -> requests.Response:
     host = urlparse(url).netloc
     RATE_LIMITER.wait(host)
-    return requests.get(url, headers=headers, timeout=timeout)
+    return SESSION.get(url, headers=headers, timeout=timeout)
 
 
-def get_json_with_retries(url: str, headers: Dict[str, str], timeout: int = 30, attempts: int = 3) -> Optional[dict]:
+def get_json_with_retries(url: str, headers: Dict[str, str], timeout: int = API_TIMEOUT, attempts: int = 2) -> Optional[dict]:
     for i in range(attempts):
         try:
             resp = rate_limited_get(url, headers=headers, timeout=timeout)
@@ -117,7 +131,7 @@ def get_json_with_retries(url: str, headers: Dict[str, str], timeout: int = 30, 
                 return resp.json()
         except requests.RequestException:
             pass
-        time.sleep(0.5 + i * 0.5)  # Reduced sleep time
+        time.sleep(0.3 + i * 0.3)
     return None
 
 
@@ -281,7 +295,7 @@ def _extract_phone_email(text: str) -> Tuple[Optional[str], Optional[str]]:
 def scrape_telelistas(query: str) -> Tuple[Optional[str], Optional[str]]:
     try:
         url = f"https://www.telelistas.net/busca?q={requests.utils.quote(query)}"
-        r = rate_limited_get(url, headers=rotate_headers(), timeout=15)  # Reduced timeout
+        r = rate_limited_get(url, headers=rotate_headers(), timeout=SCRAPE_TIMEOUT)
         if r.status_code != 200:
             return None, None
         
@@ -302,14 +316,14 @@ def scrape_consultasocio(query: str) -> Tuple[Optional[str], Optional[str]]:
     try:
         # First try search by company name
         search_url = f"https://www.consultasocio.com/q/{requests.utils.quote(query)}"
-        r = rate_limited_get(search_url, headers=rotate_headers(), timeout=15)  # Reduced timeout
+        r = rate_limited_get(search_url, headers=rotate_headers(), timeout=SCRAPE_TIMEOUT)
         if r.status_code != 200:
             return None, None
         soup = BeautifulSoup(r.text, "html.parser")
         company_link = soup.select_one('a[href*="/empresa/"]')
         if company_link and company_link.get('href'):
             detail_url = "https://www.consultasocio.com" + company_link.get('href')
-            d = rate_limited_get(detail_url, headers=rotate_headers(), timeout=15)  # Reduced timeout
+            d = rate_limited_get(detail_url, headers=rotate_headers(), timeout=SCRAPE_TIMEOUT)
             if d.status_code == 200:
                 # Try HTML-specific email extraction first
                 emails = extract_emails_from_html(d.text)
@@ -331,12 +345,12 @@ def scrape_cnpj_biz(cnpj: Optional[str], company_name: Optional[str]) -> Tuple[O
     try:
         if cnpj:
             url = f"https://cnpj.biz/{cnpj}"
-            r = rate_limited_get(url, headers=rotate_headers(), timeout=15)  # Reduced timeout
+            r = rate_limited_get(url, headers=rotate_headers(), timeout=SCRAPE_TIMEOUT)
             if r.status_code == 200:
                 return _extract_phone_email(r.text)
         if company_name:
             url = f"https://cnpj.biz/search?q={requests.utils.quote(company_name)}"
-            r = rate_limited_get(url, headers=rotate_headers(), timeout=15)  # Reduced timeout
+            r = rate_limited_get(url, headers=rotate_headers(), timeout=SCRAPE_TIMEOUT)
             if r.status_code == 200:
                 return _extract_phone_email(r.text)
     except Exception:
@@ -350,7 +364,7 @@ def scrape_guiamais(company_name: Optional[str]) -> Tuple[Optional[str], Optiona
             return None, None
         slug = requests.utils.quote(company_name)
         url = f"https://www.guiamais.com.br/busca/{slug}"
-        r = rate_limited_get(url, headers=rotate_headers(), timeout=15)  # Reduced timeout
+        r = rate_limited_get(url, headers=rotate_headers(), timeout=SCRAPE_TIMEOUT)
         if r.status_code != 200:
             return None, None
         return _extract_phone_email(r.text)
@@ -363,7 +377,7 @@ def scrape_cnpj_info(cnpj: Optional[str]) -> Tuple[Optional[str], Optional[str]]
         if not cnpj:
             return None, None
         url = f"https://cnpj.info/{cnpj}"
-        r = rate_limited_get(url, headers=rotate_headers(), timeout=15)  # Reduced timeout
+        r = rate_limited_get(url, headers=rotate_headers(), timeout=SCRAPE_TIMEOUT)
         if r.status_code == 200:
             return _extract_phone_email(r.text)
     except Exception:
@@ -389,7 +403,7 @@ def scrape_empresascnpj(query: Optional[str]) -> Tuple[Optional[str], Optional[s
         if not query:
             return None, None
         url = f"https://empresascnpj.com/busca?q={requests.utils.quote(query)}"
-        r = rate_limited_get(url, headers=rotate_headers(), timeout=15)
+        r = rate_limited_get(url, headers=rotate_headers(), timeout=SCRAPE_TIMEOUT)
         if r.status_code == 200:
             return _extract_phone_email(r.text)
     except Exception:
@@ -401,7 +415,7 @@ def scrape_cnpjro(query: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
         if not query:
             return None, None
         url = f"https://cnpj.ro/busca?q={requests.utils.quote(query)}"
-        r = rate_limited_get(url, headers=rotate_headers(), timeout=15)
+        r = rate_limited_get(url, headers=rotate_headers(), timeout=SCRAPE_TIMEOUT)
         if r.status_code == 200:
             return _extract_phone_email(r.text)
     except Exception:
@@ -416,7 +430,7 @@ def scrape_empresascnpj_advanced(query: Optional[str]) -> Tuple[Optional[str], O
         search_terms = [query, query.replace(" ", ""), query.replace(" ", "-")]
         for term in search_terms:
             url = f"https://empresascnpj.com/busca?q={requests.utils.quote(term)}"
-            r = rate_limited_get(url, headers=rotate_headers(), timeout=15)
+            r = rate_limited_get(url, headers=rotate_headers(), timeout=SCRAPE_TIMEOUT)
             if r.status_code == 200:
                 phone, email = _extract_phone_email(r.text)
                 if phone or email:
@@ -433,7 +447,7 @@ def scrape_google_search(query: Optional[str]) -> Tuple[Optional[str], Optional[
         # Use Google search to find company websites
         search_query = f'"{query}" "contato" OR "telefone" OR "email" site:br'
         url = f"https://www.google.com/search?q={requests.utils.quote(search_query)}"
-        r = rate_limited_get(url, headers=rotate_headers(), timeout=15)
+        r = rate_limited_get(url, headers=rotate_headers(), timeout=SCRAPE_TIMEOUT)
         if r.status_code == 200:
             # Extract potential company URLs from search results
             soup = BeautifulSoup(r.text, "html.parser")
@@ -442,7 +456,7 @@ def scrape_google_search(query: Optional[str]) -> Tuple[Optional[str], Optional[
                 href = link.get("href", "")
                 if "google.com" not in href and any(domain in href for domain in [".com.br", ".br", ".com"]):
                     try:
-                        company_page = rate_limited_get(href, headers=rotate_headers(), timeout=10)
+                        company_page = rate_limited_get(href, headers=rotate_headers(), timeout=SCRAPE_TIMEOUT)
                         if company_page.status_code == 200:
                             phone, email = _extract_phone_email(company_page.text)
                             if phone or email:
