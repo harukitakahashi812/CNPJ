@@ -220,19 +220,60 @@ def _extract_phone_email(text: str) -> Tuple[Optional[str], Optional[str]]:
             if phone and len(phone) >= 10:
                 break
     
-    # Improved email regex patterns
+    # Much more aggressive email regex patterns
     email_patterns = [
-        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",  # Standard email
-        r"[A-Za-z0-9._%+-]+\s*@\s*[A-Za-z0-9.-]+\s*\.\s*[A-Za-z]{2,}",  # Email with spaces
-        r"[A-Za-z0-9._%+-]+\s*\[at\]\s*[A-Za-z0-9.-]+\s*\[dot\]\s*[A-Za-z]{2,}",  # [at] [dot] format
+        # Standard email formats
+        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+        r"[A-Za-z0-9._%+-]+\s*@\s*[A-Za-z0-9.-]+\s*\.\s*[A-Za-z]{2,}",
+        
+        # Common variations
+        r"[A-Za-z0-9._%+-]+\s*@\s*[A-Za-z0-9.-]+\s*\.\s*[A-Za-z]{2,}",
+        r"[A-Za-z0-9._%+-]+\s*@\s*[A-Za-z0-9.-]+\s*\.\s*[A-Za-z]{2,}",
+        
+        # Encoded formats
+        r"[A-Za-z0-9._%+-]+\s*\[at\]\s*[A-Za-z0-9.-]+\s*\[dot\]\s*[A-Za-z]{2,}",
+        r"[A-Za-z0-9._%+-]+\s*\(at\)\s*[A-Za-z0-9.-]+\s*\(dot\)\s*[A-Za-z]{2,}",
+        r"[A-Za-z0-9._%+-]+\s*{at}\s*[A-Za-z0-9.-]+\s*{dot}\s*[A-Za-z]{2,}",
+        
+        # With common TLDs
+        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.(?:com|br|net|org|info|biz|co|gov|edu)",
+        
+        # Partial matches that we can fix
+        r"[A-Za-z0-9._%+-]+\s*@\s*[A-Za-z0-9.-]+",
+        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+",
     ]
     
+    # Try to find emails with multiple approaches
+    found_emails = []
+    
+    # First pass: try all patterns
     for pattern in email_patterns:
-        em = re.search(pattern, text)
-        if em:
-            email = em.group(0).replace(" ", "").replace("[at]", "@").replace("[dot]", ".")
-            if "@" in email and "." in email.split("@")[1]:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        for match in matches:
+            if isinstance(match, str):
+                email_candidate = match.strip()
+            else:
+                email_candidate = "".join(match).strip()
+            
+            # Clean up the email
+            email_candidate = email_candidate.replace(" ", "").replace("[at]", "@").replace("[dot]", ".")
+            email_candidate = email_candidate.replace("(at)", "@").replace("(dot)", ".")
+            email_candidate = email_candidate.replace("{at}", "@").replace("{dot}", ".")
+            
+            # Validate basic email structure
+            if "@" in email_candidate and "." in email_candidate.split("@")[1]:
+                if len(email_candidate) > 5 and len(email_candidate) < 100:
+                    found_emails.append(email_candidate)
+    
+    # Remove duplicates and get the best email
+    if found_emails:
+        # Prefer emails with .com.br or .br domains for Brazilian companies
+        for email in found_emails:
+            if email.endswith('.com.br') or email.endswith('.br'):
+                email = email
                 break
+        else:
+            email = found_emails[0]  # Take the first valid email
     
     return phone, email
 
@@ -243,6 +284,14 @@ def scrape_telelistas(query: str) -> Tuple[Optional[str], Optional[str]]:
         r = rate_limited_get(url, headers=rotate_headers(), timeout=15)  # Reduced timeout
         if r.status_code != 200:
             return None, None
+        
+        # Try HTML-specific email extraction first
+        emails = extract_emails_from_html(r.text)
+        if emails:
+            phone, _ = _extract_phone_email(r.text)
+            return phone, emails[0]
+        
+        # Fallback to regular extraction
         phone, email = _extract_phone_email(r.text)
         return phone, email
     except Exception:
@@ -262,6 +311,14 @@ def scrape_consultasocio(query: str) -> Tuple[Optional[str], Optional[str]]:
             detail_url = "https://www.consultasocio.com" + company_link.get('href')
             d = rate_limited_get(detail_url, headers=rotate_headers(), timeout=15)  # Reduced timeout
             if d.status_code == 200:
+                # Try HTML-specific email extraction first
+                emails = extract_emails_from_html(d.text)
+                if emails:
+                    text = BeautifulSoup(d.text, "html.parser").get_text(" ")
+                    phone, _ = _extract_phone_email(text)
+                    return phone, emails[0]
+                
+                # Fallback to regular extraction
                 text = BeautifulSoup(d.text, "html.parser").get_text(" ")
                 phone, email = _extract_phone_email(text)
                 return phone, email
@@ -397,6 +454,72 @@ def scrape_google_search(query: Optional[str]) -> Tuple[Optional[str], Optional[
     return None, None
 
 
+def extract_emails_from_html(html_content: str) -> List[str]:
+    """Extract emails from HTML content using multiple methods"""
+    emails = []
+    
+    # Method 1: Extract from href="mailto:" links
+    mailto_pattern = r'mailto:([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})'
+    mailto_emails = re.findall(mailto_pattern, html_content, re.IGNORECASE)
+    emails.extend(mailto_emails)
+    
+    # Method 2: Extract from data attributes
+    data_pattern = r'data-email="([^"]+)"'
+    data_emails = re.findall(data_pattern, html_content, re.IGNORECASE)
+    emails.extend(data_emails)
+    
+    # Method 3: Extract from script tags (JSON data)
+    script_pattern = r'<script[^>]*>(.*?)</script>'
+    scripts = re.findall(script_pattern, html_content, re.DOTALL | re.IGNORECASE)
+    for script in scripts:
+        # Look for email patterns in JavaScript
+        script_emails = re.findall(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', script, re.IGNORECASE)
+        emails.extend(script_emails)
+    
+    # Method 4: Extract from meta tags
+    meta_pattern = r'<meta[^>]*content="([^"]*[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}[^"]*)"'
+    meta_emails = re.findall(meta_pattern, html_content, re.IGNORECASE)
+    emails.extend(meta_emails)
+    
+    # Clean and validate emails
+    valid_emails = []
+    for email in emails:
+        email = email.strip()
+        if "@" in email and "." in email.split("@")[1]:
+            if len(email) > 5 and len(email) < 100:
+                valid_emails.append(email)
+    
+    return list(set(valid_emails))  # Remove duplicates
+
+
+def scrape_company_website(company_name: str) -> Tuple[Optional[str], Optional[str]]:
+    """Try to find and scrape company's own website for contact info"""
+    try:
+        # Common Brazilian company website patterns
+        website_patterns = [
+            f"https://www.{company_name.lower().replace(' ', '').replace('-', '')}.com.br",
+            f"https://{company_name.lower().replace(' ', '').replace('-', '')}.com.br",
+            f"https://www.{company_name.lower().replace(' ', '').replace('-', '')}.br",
+            f"https://{company_name.lower().replace(' ', '').replace('-', '')}.br",
+        ]
+        
+        for website in website_patterns:
+            try:
+                r = rate_limited_get(website, headers=rotate_headers(), timeout=10)
+                if r.status_code == 200:
+                    # Extract emails using specialized HTML parser
+                    emails = extract_emails_from_html(r.text)
+                    if emails:
+                        # Also try regular extraction for phone
+                        phone, _ = _extract_phone_email(r.text)
+                        return phone, emails[0]  # Return first valid email
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None, None
+
+
 def scrape_google_cse(query: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     try:
         api_key = os.environ.get("GOOGLE_API_KEY")
@@ -449,6 +572,7 @@ def scrape_fallback(company_name: Optional[str], cnpj: Optional[str]) -> Tuple[O
         sources.append((scrape_empresascnpj, (company_name,)))
         sources.append((scrape_empresascnpj_advanced, (company_name,)))
         sources.append((scrape_cnpjro, (company_name,)))
+        sources.append((scrape_company_website, (company_name,)))  # Try company's own website first
         sources.append((scrape_google_search, (company_name,)))
         sources.append((scrape_google_cse, (company_name,)))
     sources.append((scrape_cnpj_biz, (cnpj, company_name)))
