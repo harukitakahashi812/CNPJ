@@ -52,11 +52,16 @@ def load_bank_map() -> Dict[str, Dict[str, str]]:
                         c = clean_cnpj(row.get("cnpj", ""))
                         if not c:
                             continue
-                        bank_map[c] = {
-                            "agencia": (row.get("agencia", "") or "").strip(),
-                            "conta": (row.get("conta", "") or "").strip(),
-                        }
-                print(f"Loaded bank data from {p}: {len(bank_map)} entries")
+                        # Only add if we have real data (not empty strings)
+                        agencia = (row.get("agencia", "") or "").strip()
+                        conta = (row.get("conta", "") or "").strip()
+                        if agencia and conta:  # Only add if both fields have real data
+                            bank_map[c] = {
+                                "agencia": agencia,
+                                "conta": conta,
+                            }
+                if bank_map:
+                    print(f"Loaded real bank data from {p}: {len(bank_map)} entries")
                 break
         except Exception as e:
             print(f"Failed to load bank data from {p}: {e}")
@@ -346,6 +351,52 @@ def scrape_cnpjro(query: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
         return None, None
 
 
+def scrape_empresascnpj_advanced(query: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        if not query:
+            return None, None
+        # Try multiple search patterns
+        search_terms = [query, query.replace(" ", ""), query.replace(" ", "-")]
+        for term in search_terms:
+            url = f"https://empresascnpj.com/busca?q={requests.utils.quote(term)}"
+            r = rate_limited_get(url, headers=rotate_headers(), timeout=15)
+            if r.status_code == 200:
+                phone, email = _extract_phone_email(r.text)
+                if phone or email:
+                    return phone, email
+    except Exception:
+        return None, None
+    return None, None
+
+
+def scrape_google_search(query: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        if not query:
+            return None, None
+        # Use Google search to find company websites
+        search_query = f'"{query}" "contato" OR "telefone" OR "email" site:br'
+        url = f"https://www.google.com/search?q={requests.utils.quote(search_query)}"
+        r = rate_limited_get(url, headers=rotate_headers(), timeout=15)
+        if r.status_code == 200:
+            # Extract potential company URLs from search results
+            soup = BeautifulSoup(r.text, "html.parser")
+            links = soup.select("a[href*='http']")
+            for link in links[:3]:  # Check first 3 results
+                href = link.get("href", "")
+                if "google.com" not in href and any(domain in href for domain in [".com.br", ".br", ".com"]):
+                    try:
+                        company_page = rate_limited_get(href, headers=rotate_headers(), timeout=10)
+                        if company_page.status_code == 200:
+                            phone, email = _extract_phone_email(company_page.text)
+                            if phone or email:
+                                return phone, email
+                    except Exception:
+                        continue
+    except Exception:
+        return None, None
+    return None, None
+
+
 def scrape_google_cse(query: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     try:
         api_key = os.environ.get("GOOGLE_API_KEY")
@@ -396,7 +447,9 @@ def scrape_fallback(company_name: Optional[str], cnpj: Optional[str]) -> Tuple[O
         sources.append((scrape_guiamais, (company_name,)))
         sources.append((scrape_empresite, (company_name,)))
         sources.append((scrape_empresascnpj, (company_name,)))
+        sources.append((scrape_empresascnpj_advanced, (company_name,)))
         sources.append((scrape_cnpjro, (company_name,)))
+        sources.append((scrape_google_search, (company_name,)))
         sources.append((scrape_google_cse, (company_name,)))
     sources.append((scrape_cnpj_biz, (cnpj, company_name)))
     sources.append((scrape_cnpj_info, (cnpj,)))
